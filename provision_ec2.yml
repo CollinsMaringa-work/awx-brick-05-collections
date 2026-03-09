@@ -11,7 +11,7 @@
     key_pair_name: awx-brick5-key
     security_group_name: awx-learning-sg
     instance_name: awx-brick5-ec2
-    ssh_public_key: "{{ lookup('file', '~/.ssh/awx_learning_key.pub') }}"
+    ssh_public_key: "SET_VIA_AWX_EXTRA_VARS"
 
   tasks:
     - name: Ensure SSH key pair exists in AWS
