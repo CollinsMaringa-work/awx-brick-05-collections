@@ -4,7 +4,6 @@ system_timezone: "UTC"
 
 # Packages installed on every server regardless of role
 system_baseline_packages:
-  - curl
   - wget
   - vim
   - htop
