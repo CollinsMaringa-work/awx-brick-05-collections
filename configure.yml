@@ -7,7 +7,6 @@
   vars:
     system_timezone: "Europe/Paris"
     system_baseline_packages:
-      - curl
       - wget
       - vim
       - sysstat
