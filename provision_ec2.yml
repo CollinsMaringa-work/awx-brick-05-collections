@@ -48,7 +48,7 @@
           isDefault: "true"
       register: vpc_info
 
-    - name: Get default subnet
+    - name: Get subnets in default VPC
       amazon.aws.ec2_vpc_subnet_info:
         region: "{{ aws_region }}"
         access_key: "{{ tmp_key }}"
@@ -56,8 +56,11 @@
         session_token: "{{ tmp_token }}"
         filters:
           vpc-id: "{{ vpc_info.vpcs[0].vpc_id }}"
-          defaultForAz: "true"
       register: subnet_info
+
+    - name: Debug available subnets
+      ansible.builtin.debug:
+        msg: "Found {{ subnet_info.subnets | length }} subnets: {{ subnet_info.subnets | map(attribute='subnet_id') | list }}"
 
     - name: Ensure security group exists
       amazon.aws.ec2_security_group:
