@@ -5,7 +5,7 @@
   gather_facts: false
 
   vars:
-    aws_region: YOUR_REGION
+    aws_region: us-east-1
     instance_type: t2.micro
     ami_id: ami-0c421724a94bba6d6
     key_pair_name: awx-brick5-key
