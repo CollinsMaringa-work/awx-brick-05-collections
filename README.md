@@ -14,7 +14,6 @@
 | nginx role | Custom — written from scratch | `geerlingguy.nginx` from Galaxy |
 | EC2 provisioning | Manual via AWS console | `amazon.aws.ec2_instance` module |
 | Role source | Local `roles/` directory | Galaxy + local |
-| Collection source | `collections/requirements.yml` | Same — extended |
 | Playbook structure | Single `site.yml` | `provision_ec2.yml` + `configure.yml` imported by `site.yml` |
 | IAM role permissions | EC2 read only | EC2 full access (write needed to create instances) |
 
@@ -90,6 +89,7 @@ collections:
 ### roles/requirements.yml
 
 AWX installs Galaxy roles listed here automatically during project sync.
+This file must be at `roles/requirements.yml` — not the repo root.
 
 ```yaml
 ---
@@ -158,10 +158,16 @@ The current role only has read access from Brick 3. Update it.
 
 ---
 
-## Part 6 — Find the Amazon Linux 2023 AMI ID
+## Part 6 — Gather Required AWS Values Manually
 
-Each AWS region has different AMI IDs. Run this on the Mac terminal to get
-the latest one for the target region:
+> **Important:** The following values must be collected manually from the AWS
+> account before editing any playbook files. Dynamic VPC and subnet lookup
+> is not reliable with the collection version bundled in AWX — hardcoding
+> is the correct approach here.
+
+### 6a — Amazon Linux 2023 AMI ID
+
+AMI IDs differ per region. Run this on the Mac terminal:
 
 ```bash
 aws ec2 describe-images \
@@ -175,16 +181,69 @@ aws ec2 describe-images \
   --profile awx-automation
 ```
 
-Copy the output — it looks like `ami-0abcdef1234567890`. This value goes into
-`provision_ec2.yml`.
+### 6b — VPC ID
+
+> **Important:** Do not assume a default VPC exists — it may have been
+> deleted. List all available VPCs and pick the correct one explicitly.
+
+```bash
+aws ec2 describe-vpcs \
+  --region YOUR_REGION \
+  --profile awx-automation \
+  --query "Vpcs[*].{ID:VpcId,Name:Tags[?Key=='Name']|[0].Value,CIDR:CidrBlock}" \
+  --output table
+```
+
+### 6c — Subnet ID
+
+> **Important:** The subnet must have `MapPublicIpOnLaunch = True`. A private
+> subnet will cause the configure phase to fail — AWX running inside Minikube
+> on the Mac cannot reach a private IP address.
+
+```bash
+aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=YOUR_VPC_ID" \
+  --region YOUR_REGION \
+  --profile awx-automation \
+  --query "Subnets[*].{ID:SubnetId,AZ:AvailabilityZone,CIDR:CidrBlock,Public:MapPublicIpOnLaunch}" \
+  --output table
+```
+
+Pick a subnet where `Public = True`.
+
+### 6d — Security Group Check
+
+If `awx-learning-sg` already exists from a previous brick, verify it is in
+the same VPC. AWS rejects duplicate names within the same VPC.
+
+```bash
+aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=awx-learning-sg" \
+  --region YOUR_REGION \
+  --profile awx-automation \
+  --query "SecurityGroups[*].{ID:GroupId,VPC:VpcId,Name:GroupName}" \
+  --output table
+```
+
+| Result | Action |
+|---|---|
+| Empty | Nothing — the playbook creates it |
+| Found in same VPC | Nothing — the playbook reconciles it |
+| Found in a different VPC | Change `security_group_name` to `awx-brick5-sg` in the playbook |
 
 ---
 
 ## Part 7 — provision_ec2.yml
 
-This playbook runs against `localhost`. It calls the AWS API from the AWX
-execution environment to create the EC2 instance, then waits until port 22
-is reachable before finishing.
+> **Important notes:**
+> - Replace all placeholder values (`YOUR_REGION`, `YOUR_AMI_ID`,
+>   `YOUR_VPC_ID`, `YOUR_SUBNET_ID`, `ACCOUNT_ID`) with values from Part 6
+> - `ssh_public_key` is intentionally a placeholder — injected via AWX
+>   Extra Variables at runtime (see Part 12)
+> - `module_defaults` group syntax and `assume_role` as a module parameter
+>   are not supported in the AWX bundled collection version — role assumption
+>   is handled via an explicit `sts_assume_role` task, and temporary
+>   credentials are passed to every subsequent task individually
 
 ```yaml
 ---
@@ -196,41 +255,48 @@ is reachable before finishing.
   vars:
     aws_region: YOUR_REGION
     instance_type: t2.micro
-    ami_id: YOUR_AMAZON_LINUX_2023_AMI_ID
+    ami_id: YOUR_AMI_ID
     key_pair_name: awx-brick5-key
     security_group_name: awx-learning-sg
     instance_name: awx-brick5-ec2
-    ssh_public_key: "{{ lookup('file', '~/.ssh/awx_learning_key.pub') }}"
+    assume_role_arn: "arn:aws:iam::ACCOUNT_ID:role/awx-dynamic-inventory-role"
+    ssh_public_key: "SET_VIA_AWX_EXTRA_VARS"
+    vpc_id: "YOUR_VPC_ID"        # set manually — see Part 6b
+    subnet_id: "YOUR_SUBNET_ID"  # set manually — must be public — see Part 6c
 
   tasks:
+    - name: Assume IAM role and get temporary credentials
+      amazon.aws.sts_assume_role:
+        role_arn: "{{ assume_role_arn }}"
+        role_session_name: "awx-provision-session"
+        region: "{{ aws_region }}"
+      register: assumed_role
+
+    - name: Set temporary credential facts
+      ansible.builtin.set_fact:
+        tmp_key:    "{{ assumed_role.sts_creds.access_key }}"
+        tmp_secret: "{{ assumed_role.sts_creds.secret_key }}"
+        tmp_token:  "{{ assumed_role.sts_creds.session_token }}"
+
     - name: Ensure SSH key pair exists in AWS
       amazon.aws.ec2_key:
         name: "{{ key_pair_name }}"
         key_material: "{{ ssh_public_key }}"
         region: "{{ aws_region }}"
+        access_key: "{{ tmp_key }}"
+        secret_key: "{{ tmp_secret }}"
+        session_token: "{{ tmp_token }}"
         state: present
-
-    - name: Get default VPC
-      amazon.aws.ec2_vpc_net_info:
-        region: "{{ aws_region }}"
-        filters:
-          isDefault: "true"
-      register: vpc_info
-
-    - name: Get default subnet
-      amazon.aws.ec2_vpc_subnet_info:
-        region: "{{ aws_region }}"
-        filters:
-          vpc-id: "{{ vpc_info.vpcs[0].vpc_id }}"
-          defaultForAz: "true"
-      register: subnet_info
 
     - name: Ensure security group exists
       amazon.aws.ec2_security_group:
         name: "{{ security_group_name }}"
         description: AWX learning security group
         region: "{{ aws_region }}"
-        vpc_id: "{{ vpc_info.vpcs[0].vpc_id }}"
+        access_key: "{{ tmp_key }}"
+        secret_key: "{{ tmp_secret }}"
+        session_token: "{{ tmp_token }}"
+        vpc_id: "{{ vpc_id }}"
         rules:
           - proto: tcp
             ports: [22]
@@ -239,16 +305,18 @@ is reachable before finishing.
             ports: [80]
             cidr_ip: 0.0.0.0/0
         state: present
-      register: sg_info
 
     - name: Launch EC2 instance
       amazon.aws.ec2_instance:
         name: "{{ instance_name }}"
         region: "{{ aws_region }}"
+        access_key: "{{ tmp_key }}"
+        secret_key: "{{ tmp_secret }}"
+        session_token: "{{ tmp_token }}"
         instance_type: "{{ instance_type }}"
         image_id: "{{ ami_id }}"
         key_name: "{{ key_pair_name }}"
-        vpc_subnet_id: "{{ subnet_info.subnets[0].subnet_id }}"
+        vpc_subnet_id: "{{ subnet_id }}"
         network:
           assign_public_ip: true
         security_groups:
@@ -280,8 +348,10 @@ is reachable before finishing.
 
 ## Part 8 — configure.yml
 
-`post_tasks` run after all roles complete — useful for tasks that depend on
-what the roles set up.
+> **Important:** The `system_baseline_packages` list defined here overrides
+> `roles/system_baseline/defaults/main.yml` entirely due to variable priority.
+> Do not include `curl` — Amazon Linux 2023 ships with `curl-minimal` which
+> conflicts with the full `curl` package and causes a dnf dependency error.
 
 ```yaml
 ---
@@ -292,8 +362,7 @@ what the roles set up.
 
   vars:
     system_timezone: "Europe/Paris"
-    system_baseline_packages:
-      - curl
+    system_baseline_packages:   # curl deliberately excluded — conflicts with curl-minimal
       - wget
       - vim
       - sysstat
@@ -337,7 +406,28 @@ what the roles set up.
 
 ---
 
-## Part 9 — site.yml
+## Part 9 — system_baseline defaults
+
+> Keep defaults consistent with `configure.yml` — `curl` excluded from both.
+
+### roles/system_baseline/defaults/main.yml
+
+```yaml
+---
+system_timezone: "Europe/Paris"
+
+system_baseline_packages:   # curl excluded — conflicts with curl-minimal on Amazon Linux 2023
+  - wget
+  - vim
+  - sysstat
+  - unzip
+
+system_update_packages: false
+```
+
+---
+
+## Part 10 — site.yml
 
 ```yaml
 ---
@@ -350,7 +440,7 @@ what the roles set up.
 
 ---
 
-## Part 10 — Push to GitHub
+## Part 11 — Push to GitHub
 
 ```bash
 git add .
@@ -360,7 +450,7 @@ git push origin main
 
 ---
 
-## Part 11 — AWX Configuration
+## Part 12 — AWX Configuration
 
 ### Create Project
 
@@ -383,30 +473,8 @@ Save → 🔄 sync → wait for green.
    - Source: `Amazon EC2`
    - Credential: `AWS IAM - awx-automation`
    - Enable: **Overwrite** ✅ **Update on launch** ✅
-   - Source variables:
-
-```yaml
----
-plugin: amazon.aws.aws_ec2
-regions:
-  - YOUR_REGION
-assume_role_arn: "arn:aws:iam::ACCOUNT_ID:role/awx-dynamic-inventory-role"
-filters:
-  tag:Environment: awx-learning
-  tag:Brick: brick-05
-  instance-state-name: running
-hostnames:
-  - ip-address
-keyed_groups:
-  - key: tags.Environment
-    prefix: env
-    separator: "_"
-compose:
-  ansible_host: public_ip_address
-  ansible_user: "'ec2-user'"
-```
-
-3. Save — **do not sync yet**, the instance does not exist until the provision job runs.
+   - Source variables: same as `inventories/aws/aws_ec2.yml` above
+3. Save — **do not sync yet**, the instance does not exist until the provision job runs
 
 ### Job Template: Provision Only
 
@@ -419,7 +487,17 @@ compose:
 | Credentials | `AWS IAM - awx-automation` |
 | Privilege Escalation | ❌ Not needed — runs on localhost |
 
-### Job Template: Full Site (Provision + Configure)
+**Extra Variables** — required, the SSH public key cannot be read from the
+Mac filesystem inside the AWX Minikube container:
+
+```yaml
+---
+ssh_public_key: "PASTE_FULL_PUBLIC_KEY_HERE"
+```
+
+Get the value with: `cat ~/.ssh/awx_learning_key.pub`
+
+### Job Template: Full Site
 
 | Field | Value |
 |---|---|
@@ -430,35 +508,41 @@ compose:
 | Credentials | `AWS IAM - awx-automation` + `AWX Learning SSH Key` |
 | Privilege Escalation | ✅ Enabled |
 
-> Two credentials are attached — AWS for the provision phase, SSH for the
+**Extra Variables** — same `ssh_public_key` entry as above.
+
+> Two credentials are required — AWS for the provision phase, SSH for the
 > configure phase. AWX supports multiple credentials per Job Template.
 
 ---
 
-## Part 12 — Launch and Verify
+## Part 13 — Launch and Verify
 
-### Recommended: Run in Two Steps (easier to debug)
+### Recommended: Run in Two Steps
 
 **Step 1 — Provision:**
 Templates → `Brick5 - Provision EC2` → 🚀
 
-Wait for the job to complete, then check:
-- AWX → **Inventories → Brick5 AWS Dynamic → 🔄 sync**
-- The instance should appear in the Hosts tab
+After completion, manually sync the inventory:
+**Inventories → Brick5 AWS Dynamic → Sources → 🔄 sync**
+
+Confirm the instance appears in the **Hosts tab** before proceeding.
 
 **Step 2 — Full run:**
 Templates → `Brick5 - Provision + Configure` → 🚀
 
-### Expected Output
+### Expected Output (second run — fully idempotent)
 
 ```
 PLAY [Provision EC2 instance] ******************************************
+
+TASK [Assume IAM role and get temporary credentials]
+changed: [localhost]
 
 TASK [Ensure SSH key pair exists in AWS]
 ok: [localhost]
 
 TASK [Launch EC2 instance]
-changed: [localhost]
+ok: [localhost]
 
 TASK [Wait for SSH to become available]
 ok: [localhost]
@@ -466,26 +550,24 @@ ok: [localhost]
 PLAY [Configure EC2 instances] *****************************************
 
 TASK [system_baseline : Set hostname]
-changed: [x.x.x.x]
+ok: [x.x.x.x]
+
+TASK [system_baseline : Install baseline packages (Amazon Linux / RedHat)]
+ok: [x.x.x.x]
 
 TASK [geerlingguy.nginx : Install nginx]
-changed: [x.x.x.x]
+ok: [x.x.x.x]
 
 TASK [Deploy custom index page]
-changed: [x.x.x.x]
+ok: [x.x.x.x]
 
 TASK [Confirm nginx is responding]
 ok: [x.x.x.x]
 
 PLAY RECAP *************************************************************
-localhost : ok=5  changed=1  unreachable=0  failed=0
-x.x.x.x  : ok=9  changed=6  unreachable=0  failed=0
+localhost : ok=7  changed=0  unreachable=0  failed=0
+x.x.x.x  : ok=9  changed=0  unreachable=0  failed=0
 ```
-
-### Idempotency Check
-
-Run `site.yml` a second time — the provision phase reports `ok` (instance
-already exists), the configure phase reports `ok` (nothing to change).
 
 ### Browser Check
 
@@ -508,19 +590,31 @@ Provisioned and configured entirely by Ansible
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ec2_key` module not found | `amazon.aws` collection not installed | Verify `collections/requirements.yml` exists and re-sync project |
-| Wrong AMI ID | AMI IDs differ per region | Run the `aws ec2 describe-images` command in Part 6 for the exact region |
-| Phase 2 finds no hosts | Instance just created, inventory not yet synced | Run provision job separately first, sync inventory manually, then run configure |
-| `geerlingguy.nginx` not found | AWX looks for `roles/requirements.yml` specifically | Confirm file is at `roles/requirements.yml` not repo root, re-sync |
-| SSH times out in `wait_for` | Security group not applied or no internet gateway | Increase `timeout` to `300`, verify security group has port 22 from `0.0.0.0/0` |
-| Permission denied creating EC2 | IAM role still has read-only permissions | Attach `AmazonEC2FullAccess` to `awx-dynamic-inventory-role` (Part 5) |
+| `lookup('file') — file not found` | AWX runs in a Minikube container — Mac filesystem not accessible | Pass `ssh_public_key` via AWX Extra Variables |
+| `module_defaults group not supported` | Older collection version in AWX | Remove `module_defaults` — use explicit credentials per task |
+| `Unsupported parameter: assume_role` | Collection version does not support it as module param | Use `sts_assume_role` task, pass `tmp_key/tmp_secret/tmp_token` per task |
+| `list object has no element 0` on VPC lookup | No default VPC — filter returned empty | Hardcode `vpc_id` and `subnet_id` — gather with CLI (Part 6) |
+| `curl conflicts with curl-minimal` | Amazon Linux 2023 ships `curl-minimal` | Remove `curl` from `system_baseline_packages` in both `configure.yml` and `defaults/main.yml` |
+| Phase 2 finds no hosts | Inventory not synced after provision | Manually sync inventory source after provision job completes |
+| `geerlingguy.nginx` not found | Wrong requirements file location | File must be at `roles/requirements.yml` — not repo root |
+| Security group VPC mismatch | `awx-learning-sg` exists in a different VPC | Change `security_group_name` to `awx-brick5-sg` |
+
+---
+
+## Known Limitations in This Setup
+
+| Limitation | Reason | Workaround |
+|---|---|---|
+| `vpc_id` and `subnet_id` hardcoded | No default VPC — dynamic lookup returns empty | Gather manually via CLI before editing the playbook (Part 6) |
+| `ssh_public_key` via Extra Variables | AWX Minikube container cannot access Mac filesystem | Set in AWX Job Template Extra Variables |
+| Explicit credentials on every task | Older `amazon.aws` collection — `module_defaults` group not supported | Accepted limitation for this AWX version |
+| Ansible version warning | AWX execution environment uses Ansible 2.15 | Informational only — does not block execution |
 
 ---
 
 ## Cleanup
 
 ```bash
-# Get the instance ID
 INSTANCE_ID=$(aws ec2 describe-instances \
   --filters "Name=tag:Brick,Values=brick-05" \
   --query "Reservations[*].Instances[*].InstanceId" \
@@ -528,7 +622,6 @@ INSTANCE_ID=$(aws ec2 describe-instances \
   --region YOUR_REGION \
   --profile awx-automation)
 
-# Terminate it
 aws ec2 terminate-instances \
   --instance-ids $INSTANCE_ID \
   --region YOUR_REGION \
@@ -548,22 +641,24 @@ aws ec2 terminate-instances \
 
 ---
 
-## Key Concepts Introduced in Brick 05
+## Key Concepts Introduced
 
 | Concept | What it means |
 |---|---|
-| Galaxy role | A pre-built, community-maintained role pulled from galaxy.ansible.com |
+| Galaxy role | Pre-built community-maintained role pulled from galaxy.ansible.com |
 | `roles/requirements.yml` | Tells AWX which Galaxy roles to install before running jobs |
 | `collections/requirements.yml` | Tells AWX which collections to install before running jobs |
+| `sts_assume_role` task | Explicitly assumes an IAM role and captures short-lived credentials |
 | `import_playbook` | Chains multiple playbooks into one execution |
 | `post_tasks` | Tasks that run after all roles in a play have completed |
-| Localhost provisioning | Running a play against `localhost` to call cloud APIs rather than SSH into a server |
+| Localhost provisioning | Play running against `localhost` to call cloud APIs — no SSH |
+| Variable priority | Playbook `vars` block always overrides `role/defaults/main.yml` |
 
 ---
 
 ## What is Next — Brick 06
 
 Brick 06 introduces Molecule — a testing framework for Ansible roles. The
-`system_baseline` and `nginx` roles get unit-tested locally using Docker
-containers as fake hosts, with a full test → converge → verify → destroy cycle
-running on the Mac before anything is pushed to AWX.
+`system_baseline` role gets unit-tested locally using Docker containers as
+fake hosts, with a full test → converge → verify → destroy cycle running
+on the Mac before anything is pushed to AWX.
