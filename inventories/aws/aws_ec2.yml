@@ -1,0 +1,24 @@
+---
+plugin: amazon.aws.aws_ec2
+
+regions:
+  - us-east-1
+
+assume_role_arn: "arn:aws:iam::396608766405:role/awx-dynamic-inventory-role"
+
+filters:
+  tag:Environment: awx-learning
+  tag:Brick: brick-05
+  instance-state-name: running
+
+hostnames:
+  - ip-address
+
+keyed_groups:
+  - key: tags.Environment
+    prefix: env
+    separator: "_"
+
+compose:
+  ansible_host: public_ip_address
+  ansible_user: "'ec2-user'"

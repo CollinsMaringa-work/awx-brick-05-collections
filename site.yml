@@ -1,0 +1,6 @@
+---
+# Phase 1 — Provision infrastructure
+- import_playbook: provision_ec2.yml
+
+# Phase 2 — Configure provisioned instances
+- import_playbook: configure.yml

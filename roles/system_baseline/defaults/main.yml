@@ -1,0 +1,14 @@
+---
+# Timezone to configure on all servers
+system_timezone: "UTC"
+
+# Packages installed on every server regardless of role
+system_baseline_packages:
+  - curl
+  - wget
+  - vim
+  - htop
+  - unzip
+
+# Whether to update all packages on first run
+system_update_packages: false
